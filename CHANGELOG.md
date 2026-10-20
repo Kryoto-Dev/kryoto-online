@@ -4,6 +4,10 @@ The `## [x.y.z]` heading for the version in `include/version.h` becomes
 the body of that version's GitHub release, so write the entry before you
 push the bump.
 
+## [1.9.1] - 2026-10-20
+
+Maintenance release for the Kryoto 0.13.0 update. No player-facing changes.
+
 ## [1.9.0] - 2026-10-09
 
 ### Added
