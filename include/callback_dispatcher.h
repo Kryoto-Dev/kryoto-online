@@ -27,21 +27,41 @@ public:
 	int m_ManualCbId;
 	int m_ManualCbSize;
 	bool m_bProcessing;
+
+	// Every CCallback the game registered, by iCallback. A multimap
+	// because one callback id routinely has several listeners, and
+	// every one of them is owed the message.
 	std::multimap<int, CCallbackBase*> m_CallbackMap;
+
+	// Pending CCallResults, by API call handle. One-shot: an entry is
+	// removed the moment its result is delivered.
 	std::map<SteamAPICall_t, CCallbackBase*> m_CallResultMap;
-	std::map<SteamAPICall_t, BYTE*> m_BufferMap;
 
 	CCallbackDispatcher();
 	~CCallbackDispatcher();
 
 	void Shutdown();
-	void DispatchFrame(HSteamPipe hPipe, bool bServer);
-	void DispatchFrameSafe(HSteamPipe hPipe, bool bServer);
-	void ExecuteCallResult(HSteamPipe hPipe, SteamAPICall_t hCall, CCallbackBase* pCb);
+
+	// Drain the pipe: every message waiting on it is delivered before
+	// this returns, as Valve's SteamAPI_RunCallbacks does.
+	void DispatchFrame(HSteamPipe hPipe, bool bServer, bool bSafe = false);
+	void DispatchFrameSafe(HSteamPipe hPipe, bool bServer) { DispatchFrame(hPipe, bServer, true); }
+
 	void Add(CCallbackBase* pCb, int iCallback);
 	void AddCallResult(CCallbackBase* pCb, SteamAPICall_t hCall);
 	void Remove(CCallbackBase* pCb);
 	void RemoveCallResult(CCallbackBase* pCb, SteamAPICall_t hCall);
+	uint32 CountRegistered(int iCallback);
+
+private:
+	// Guards both maps. Held only while reading or changing them,
+	// never across a call into the game: a handler that registers or
+	// unregisters (which most lobby code does) would deadlock on it.
+	SRWLOCK m_MapLock;
+
+	void DispatchOne(HSteamPipe hPipe, const CallbackMsg_t& msg, bool bServer, bool bSafe);
+	void RunCallResult(HSteamPipe hPipe, const SteamAPICallCompleted_t& done, bool bServer, bool bSafe);
+	bool StillRegistered(int iCallback, CCallbackBase* pCb);
 };
 
 CCallbackDispatcher* GetDispatcher();

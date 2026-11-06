@@ -68,6 +68,16 @@ public:
 
 static CSteamGameSearchStub s_GameSearchStub;
 
+// What SteamUser() hands out when [Settings]EmulateTicket is on.
+//
+// It used to be a stub through and through: GetSteamID() returned nil,
+// BLoggedOn() a hardcoded true, auth session tickets were refused and
+// BeginAuthSession rejected every ticket. Any game that identified
+// players by SteamID or authenticated them - which is most of them -
+// had no multiplayer the moment EmulateTicket was switched on. Now
+// everything goes to the real client except the two things the
+// setting is actually for: the encrypted app ticket, and a licence
+// check on the emulated AppId.
 class CSteamUserStub : public ISteamUser
 {
 public:
@@ -78,31 +88,46 @@ public:
     static void SetEmulatedApp(uint32 unAppId) { s_unEmulatedAppId = unAppId; s_bEmulateTicket = true; }
     static bool IsEmulateTicketEnabled() { return s_bEmulateTicket; }
 
-    virtual HSteamUser GetHSteamUser() override { return g_ClientUser; }
-    virtual bool BLoggedOn() override { return true; }
-    virtual CSteamID GetSteamID() override { return k_steamIDNil; }
-    virtual int InitiateGameConnection_DEPRECATED(void*, int, CSteamID, uint32, uint16, bool) override { return 0; }
-    virtual void TerminateGameConnection_DEPRECATED(uint32, uint16) override {}
-    virtual void TrackAppUsageEvent(CGameID, int, const char*) override {}
-    virtual bool GetUserDataFolder(char*, int) override { return false; }
-    virtual void StartVoiceRecording() override {}
-    virtual void StopVoiceRecording() override {}
-    virtual EVoiceResult GetAvailableVoice(uint32 *pcbCompressed, uint32 *pcbUncompressed_Deprecated = 0, uint32 nUncompressedVoiceDesiredSampleRate_Deprecated = 0) override { return k_EVoiceResultNotRecording; }
-    virtual EVoiceResult GetVoice(bool bWantCompressed, void *pDestBuffer, uint32 cbDestBufferSize, uint32 *nBytesWritten, bool bWantUncompressed_Deprecated = false, void *pUncompressedDestBuffer_Deprecated = 0, uint32 cbUncompressedDestBufferSize_Deprecated = 0, uint32 *nUncompressBytesWritten_Deprecated = 0, uint32 nUncompressedVoiceDesiredSampleRate_Deprecated = 0) override { return k_EVoiceResultNotRecording; }
-    virtual EVoiceResult DecompressVoice(const void*, uint32, void*, uint32, uint32*, uint32) override { return k_EVoiceResultNotRecording; }
-    virtual uint32 GetVoiceOptimalSampleRate() override { return 0; }
-    virtual HAuthTicket GetAuthSessionTicket(void*, int, uint32*, const SteamNetworkingIdentity*) override { return k_HAuthTicketInvalid; }
-    virtual HAuthTicket GetAuthTicketForWebApi(const char*) override { return k_HAuthTicketInvalid; }
-    virtual EBeginAuthSessionResult BeginAuthSession(const void*, int, CSteamID) override { return k_EBeginAuthSessionResultInvalidTicket; }
-    virtual void EndAuthSession(CSteamID) override {}
-    virtual void CancelAuthTicket(HAuthTicket) override {}
-    virtual EUserHasLicenseForAppResult UserHasLicenseForApp(CSteamID, AppId_t appID) override {
-        if (s_bEmulateTicket && (uint32)appID == s_unEmulatedAppId)
-            return k_EUserHasLicenseResultHasLicense;
-        return k_EUserHasLicenseResultDoesNotHaveLicense;
+    virtual HSteamUser GetHSteamUser() override { ISteamUser* r = Real(); return r ? r->GetHSteamUser() : g_ClientUser; }
+    virtual bool BLoggedOn() override { ISteamUser* r = Real(); return r ? r->BLoggedOn() : false; }
+    virtual CSteamID GetSteamID() override { ISteamUser* r = Real(); return r ? r->GetSteamID() : k_steamIDNil; }
+    virtual int InitiateGameConnection_DEPRECATED(void* pAuthBlob, int cbMaxAuthBlob, CSteamID steamIDGameServer, uint32 unIPServer, uint16 usPortServer, bool bSecure) override {
+        ISteamUser* r = Real(); return r ? r->InitiateGameConnection_DEPRECATED(pAuthBlob, cbMaxAuthBlob, steamIDGameServer, unIPServer, usPortServer, bSecure) : 0;
     }
-    virtual bool BIsBehindNAT() override { return false; }
-    virtual void AdvertiseGame(CSteamID, uint32, uint16) override {}
+    virtual void TerminateGameConnection_DEPRECATED(uint32 unIPServer, uint16 usPortServer) override { if (ISteamUser* r = Real()) r->TerminateGameConnection_DEPRECATED(unIPServer, usPortServer); }
+    virtual void TrackAppUsageEvent(CGameID gameID, int eAppUsageEvent, const char* pchExtraInfo) override { if (ISteamUser* r = Real()) r->TrackAppUsageEvent(gameID, eAppUsageEvent, pchExtraInfo); }
+    virtual bool GetUserDataFolder(char* pchBuffer, int cubBuffer) override { ISteamUser* r = Real(); return r ? r->GetUserDataFolder(pchBuffer, cubBuffer) : false; }
+    virtual void StartVoiceRecording() override { if (ISteamUser* r = Real()) r->StartVoiceRecording(); }
+    virtual void StopVoiceRecording() override { if (ISteamUser* r = Real()) r->StopVoiceRecording(); }
+    virtual EVoiceResult GetAvailableVoice(uint32 *pcbCompressed, uint32 *pcbUncompressed_Deprecated = 0, uint32 nUncompressedVoiceDesiredSampleRate_Deprecated = 0) override {
+        ISteamUser* r = Real(); return r ? r->GetAvailableVoice(pcbCompressed, pcbUncompressed_Deprecated, nUncompressedVoiceDesiredSampleRate_Deprecated) : k_EVoiceResultNotRecording;
+    }
+    virtual EVoiceResult GetVoice(bool bWantCompressed, void *pDestBuffer, uint32 cbDestBufferSize, uint32 *nBytesWritten, bool bWantUncompressed_Deprecated = false, void *pUncompressedDestBuffer_Deprecated = 0, uint32 cbUncompressedDestBufferSize_Deprecated = 0, uint32 *nUncompressBytesWritten_Deprecated = 0, uint32 nUncompressedVoiceDesiredSampleRate_Deprecated = 0) override {
+        ISteamUser* r = Real();
+        return r ? r->GetVoice(bWantCompressed, pDestBuffer, cbDestBufferSize, nBytesWritten, bWantUncompressed_Deprecated, pUncompressedDestBuffer_Deprecated, cbUncompressedDestBufferSize_Deprecated, nUncompressBytesWritten_Deprecated, nUncompressedVoiceDesiredSampleRate_Deprecated) : k_EVoiceResultNotRecording;
+    }
+    virtual EVoiceResult DecompressVoice(const void* pCompressed, uint32 cbCompressed, void* pDestBuffer, uint32 cbDestBufferSize, uint32* nBytesWritten, uint32 nDesiredSampleRate) override {
+        ISteamUser* r = Real(); return r ? r->DecompressVoice(pCompressed, cbCompressed, pDestBuffer, cbDestBufferSize, nBytesWritten, nDesiredSampleRate) : k_EVoiceResultNotRecording;
+    }
+    virtual uint32 GetVoiceOptimalSampleRate() override { ISteamUser* r = Real(); return r ? r->GetVoiceOptimalSampleRate() : 0; }
+    virtual HAuthTicket GetAuthSessionTicket(void* pTicket, int cbMaxTicket, uint32* pcbTicket, const SteamNetworkingIdentity* pSteamNetworkingIdentity) override {
+        ISteamUser* r = Real(); return r ? r->GetAuthSessionTicket(pTicket, cbMaxTicket, pcbTicket, pSteamNetworkingIdentity) : k_HAuthTicketInvalid;
+    }
+    virtual HAuthTicket GetAuthTicketForWebApi(const char* pchIdentity) override { ISteamUser* r = Real(); return r ? r->GetAuthTicketForWebApi(pchIdentity) : k_HAuthTicketInvalid; }
+    virtual EBeginAuthSessionResult BeginAuthSession(const void* pAuthTicket, int cbAuthTicket, CSteamID steamID) override {
+        ISteamUser* r = Real(); return r ? r->BeginAuthSession(pAuthTicket, cbAuthTicket, steamID) : k_EBeginAuthSessionResultInvalidTicket;
+    }
+    virtual void EndAuthSession(CSteamID steamID) override { if (ISteamUser* r = Real()) r->EndAuthSession(steamID); }
+    virtual void CancelAuthTicket(HAuthTicket hAuthTicket) override { if (ISteamUser* r = Real()) r->CancelAuthTicket(hAuthTicket); }
+    virtual EUserHasLicenseForAppResult UserHasLicenseForApp(CSteamID steamID, AppId_t appID) override {
+        ISteamUser* r = Real();
+        EUserHasLicenseForAppResult res = r ? r->UserHasLicenseForApp(steamID, appID) : k_EUserHasLicenseResultDoesNotHaveLicense;
+        if (res == k_EUserHasLicenseResultDoesNotHaveLicense && s_bEmulateTicket && (uint32)appID == s_unEmulatedAppId)
+            return k_EUserHasLicenseResultHasLicense;
+        return res;
+    }
+    virtual bool BIsBehindNAT() override { ISteamUser* r = Real(); return r ? r->BIsBehindNAT() : false; }
+    virtual void AdvertiseGame(CSteamID steamIDGameServer, uint32 unIPServer, uint16 usPortServer) override { if (ISteamUser* r = Real()) r->AdvertiseGame(steamIDGameServer, unIPServer, usPortServer); }
     virtual SteamAPICall_t RequestEncryptedAppTicket(void* pDataToInclude, int cbDataToInclude) override {
         s_EncryptedTicket.clear();
         s_EncryptedTicket.resize(128);
@@ -119,18 +144,19 @@ public:
         }
         return true;
     }
-    virtual int GetGameBadgeLevel(int, bool) override { return 0; }
-    virtual int GetPlayerSteamLevel() override { return 0; }
-    virtual SteamAPICall_t RequestStoreAuthURL(const char*) override { return k_uAPICallInvalid; }
-    virtual bool BIsPhoneVerified() override { return false; }
-    virtual bool BIsTwoFactorEnabled() override { return false; }
-    virtual bool BIsPhoneIdentifying() override { return false; }
-    virtual bool BIsPhoneRequiringVerification() override { return false; }
-    virtual SteamAPICall_t GetMarketEligibility() override { return k_uAPICallInvalid; }
-    virtual SteamAPICall_t GetDurationControl() override { return k_uAPICallInvalid; }
-    virtual bool BSetDurationControlOnlineState(EDurationControlOnlineState) override { return false; }
+    virtual int GetGameBadgeLevel(int nSeries, bool bFoil) override { ISteamUser* r = Real(); return r ? r->GetGameBadgeLevel(nSeries, bFoil) : 0; }
+    virtual int GetPlayerSteamLevel() override { ISteamUser* r = Real(); return r ? r->GetPlayerSteamLevel() : 0; }
+    virtual SteamAPICall_t RequestStoreAuthURL(const char* pchRedirectURL) override { ISteamUser* r = Real(); return r ? r->RequestStoreAuthURL(pchRedirectURL) : k_uAPICallInvalid; }
+    virtual bool BIsPhoneVerified() override { ISteamUser* r = Real(); return r ? r->BIsPhoneVerified() : false; }
+    virtual bool BIsTwoFactorEnabled() override { ISteamUser* r = Real(); return r ? r->BIsTwoFactorEnabled() : false; }
+    virtual bool BIsPhoneIdentifying() override { ISteamUser* r = Real(); return r ? r->BIsPhoneIdentifying() : false; }
+    virtual bool BIsPhoneRequiringVerification() override { ISteamUser* r = Real(); return r ? r->BIsPhoneRequiringVerification() : false; }
+    virtual SteamAPICall_t GetMarketEligibility() override { ISteamUser* r = Real(); return r ? r->GetMarketEligibility() : k_uAPICallInvalid; }
+    virtual SteamAPICall_t GetDurationControl() override { ISteamUser* r = Real(); return r ? r->GetDurationControl() : k_uAPICallInvalid; }
+    virtual bool BSetDurationControlOnlineState(EDurationControlOnlineState eNewState) override { ISteamUser* r = Real(); return r ? r->BSetDurationControlOnlineState(eNewState) : false; }
 
 private:
+    static ISteamUser* Real();
     static uint32 GenerateFakeTicket(uint8_t* pTicket, uint32 cbMaxTicket, void* pDataToInclude, int cbDataToInclude);
 };
 
@@ -320,41 +346,89 @@ public:
 
 extern CSteamAPIContext g_ClientCtx;
 
+extern uint32 g_ForcedAppId;
+extern uint32 g_OriginalAppId;
+
+// What SteamApps() hands out to C++ games.
+//
+// This used to answer everything itself: language "english" for every
+// player, BIsLowViolence true, no install folder, no launch command line
+// (which is where `+connect_lobby` arrives when a friend's invite starts
+// the game), build id 0, and yes to every ownership question about every
+// app. Games built on the flat API (Unity, Godot) got the real client
+// the whole time, so the two kinds of game disagreed on basics. Now it
+// forwards, and only the ownership answers the ini asks for are changed:
+// the game itself and [Settings]UnlockDLC. The core hooks the same
+// methods on the live client, so the flat API gives the same answers.
 class CSteamAppsStub : public ISteamApps
 {
 public:
     static std::vector<uint32> s_UnlockedDLCAppIds;
     static void SetUnlockedDLCAppIds(const std::vector<uint32>& appIds) { s_UnlockedDLCAppIds = appIds; }
-    virtual bool BIsSubscribed() override { return true; }
-    virtual bool BIsLowViolence() override { return true; }
-    virtual bool BIsCybercafe() override { return false; }
-    virtual bool BIsVACBanned() override { return false; }
-    virtual const char *GetCurrentGameLanguage() override { return "english"; }
-    virtual const char *GetAvailableGameLanguages() override { return "english"; }
-    virtual bool BIsSubscribedApp(AppId_t appID) override {
-        for (uint32 id : s_UnlockedDLCAppIds) {
+
+    static bool IsUnlocked(AppId_t appID)
+    {
+        for (uint32 id : s_UnlockedDLCAppIds)
             if (id == (uint32)appID) return true;
-        }
-        return true;
+        return false;
+    }
+
+    static bool IsSelf(AppId_t appID)
+    {
+        return appID != 0 && ((uint32)appID == g_ForcedAppId || (g_OriginalAppId != 0 && (uint32)appID == g_OriginalAppId));
+    }
+
+    virtual bool BIsSubscribed() override { return true; }
+    virtual bool BIsLowViolence() override { ISteamApps* r = Real(); return r ? r->BIsLowViolence() : false; }
+    virtual bool BIsCybercafe() override { ISteamApps* r = Real(); return r ? r->BIsCybercafe() : false; }
+    virtual bool BIsVACBanned() override { ISteamApps* r = Real(); return r ? r->BIsVACBanned() : false; }
+    virtual const char *GetCurrentGameLanguage() override { ISteamApps* r = Real(); const char* l = r ? r->GetCurrentGameLanguage() : nullptr; return (l && l[0]) ? l : "english"; }
+    virtual const char *GetAvailableGameLanguages() override { ISteamApps* r = Real(); const char* l = r ? r->GetAvailableGameLanguages() : nullptr; return (l && l[0]) ? l : "english"; }
+    virtual bool BIsSubscribedApp(AppId_t appID) override {
+        if (IsSelf(appID) || IsUnlocked(appID)) return true;
+        ISteamApps* r = Real(); return r ? r->BIsSubscribedApp(appID) : false;
     }
     virtual bool BIsDlcInstalled(AppId_t appID) override {
-        for (uint32 id : s_UnlockedDLCAppIds) {
-            if (id == (uint32)appID) return true;
-        }
-        return true;
+        if (IsUnlocked(appID)) return true;
+        ISteamApps* r = Real(); return r ? r->BIsDlcInstalled(appID) : false;
     }
-    virtual uint32 GetEarliestPurchaseUnixTime(AppId_t nAppID) override { return 0; }
+    virtual uint32 GetEarliestPurchaseUnixTime(AppId_t nAppID) override { ISteamApps* r = Real(); return r ? r->GetEarliestPurchaseUnixTime(nAppID) : 0; }
     virtual bool BIsSubscribedFromFreeWeekend() override { return false; }
-    virtual int GetDLCCount() override { return 0; }
-    virtual bool BGetDLCDataByIndex(int iDLC, AppId_t *pAppID, bool *pbAvailable, char *pchName, int cchNameBufferSize) override { return false; }
-    virtual void InstallDLC(AppId_t nAppID) override {}
-    virtual void UninstallDLC(AppId_t nAppID) override {}
-    virtual void RequestAppProofOfPurchaseKey(AppId_t nAppID) override {}
-    virtual bool GetCurrentBetaName(char *pchName, int cchNameBufferSize) override { return false; }
+    virtual int GetDLCCount() override { ISteamApps* r = Real(); return r ? r->GetDLCCount() : 0; }
+    virtual bool BGetDLCDataByIndex(int iDLC, AppId_t *pAppID, bool *pbAvailable, char *pchName, int cchNameBufferSize) override {
+        ISteamApps* r = Real(); return r ? r->BGetDLCDataByIndex(iDLC, pAppID, pbAvailable, pchName, cchNameBufferSize) : false;
+    }
+    virtual void InstallDLC(AppId_t nAppID) override { if (ISteamApps* r = Real()) r->InstallDLC(nAppID); }
+    virtual void UninstallDLC(AppId_t nAppID) override { if (ISteamApps* r = Real()) r->UninstallDLC(nAppID); }
+    virtual void RequestAppProofOfPurchaseKey(AppId_t nAppID) override { if (ISteamApps* r = Real()) r->RequestAppProofOfPurchaseKey(nAppID); }
+    virtual bool GetCurrentBetaName(char *pchName, int cchNameBufferSize) override { ISteamApps* r = Real(); return r ? r->GetCurrentBetaName(pchName, cchNameBufferSize) : false; }
     virtual bool MarkContentCorrupt(bool bMissingFilesOnly) override { return false; }
-    virtual uint32 GetInstalledDepots(AppId_t appID, DepotId_t *pvecDepots, uint32 cMaxDepots) override { return 0; }
-    virtual uint32 GetAppInstallDir(AppId_t appID, char *pchFolder, uint32 cchFolderBufferSize) override { return 0; }
-    virtual bool BIsAppInstalled(AppId_t appID) override { return true; }
+    virtual uint32 GetInstalledDepots(AppId_t appID, DepotId_t *pvecDepots, uint32 cMaxDepots) override { ISteamApps* r = Real(); return r ? r->GetInstalledDepots(appID, pvecDepots, cMaxDepots) : 0; }
+    virtual uint32 GetAppInstallDir(AppId_t appID, char *pchFolder, uint32 cchFolderBufferSize) override {
+        // The game's own folder is where it is running - not wherever
+        // Steam keeps Spacewar, and not nowhere.
+        if (IsSelf(appID) && pchFolder && cchFolderBufferSize > 0)
+        {
+            char path[MAX_PATH] = { 0 };
+            DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+            char* slash = (n > 0 && n < MAX_PATH) ? strrchr(path, '\\') : nullptr;
+            if (slash)
+            {
+                *slash = '\0';
+                size_t len = strlen(path);
+                if (len + 1 <= cchFolderBufferSize)
+                {
+                    memcpy(pchFolder, path, len + 1);
+                    return (uint32)(len + 1);
+                }
+            }
+        }
+        ISteamApps* r = Real(); return r ? r->GetAppInstallDir(appID, pchFolder, cchFolderBufferSize) : 0;
+    }
+    virtual bool BIsAppInstalled(AppId_t appID) override {
+        if (IsSelf(appID) || IsUnlocked(appID)) return true;
+        ISteamApps* r = Real(); return r ? r->BIsAppInstalled(appID) : false;
+    }
 
     virtual CSteamID GetAppOwner() override { 
         if (g_ClientCtx.SteamUser())
@@ -362,21 +436,23 @@ public:
         return k_steamIDNil; 
     }
     
-    virtual const char *GetLaunchQueryParam(const char *pchKey) override { return ""; }
-    virtual bool GetDlcDownloadProgress(AppId_t nAppID, uint64 *punBytesDownloaded, uint64 *punBytesTotal) override { return false; }
-    virtual int GetAppBuildId() override { return 0; }
-    virtual void RequestAllProofOfPurchaseKeys() override {}
-    virtual SteamAPICall_t GetFileDetails(const char* pszFileName) override { return k_uAPICallInvalid; }
-    virtual int GetLaunchCommandLine(char *pszCommandLine, int cubCommandLine) override { return 0; }
+    virtual const char *GetLaunchQueryParam(const char *pchKey) override { ISteamApps* r = Real(); const char* v = r ? r->GetLaunchQueryParam(pchKey) : nullptr; return v ? v : ""; }
+    virtual bool GetDlcDownloadProgress(AppId_t nAppID, uint64 *punBytesDownloaded, uint64 *punBytesTotal) override { ISteamApps* r = Real(); return r ? r->GetDlcDownloadProgress(nAppID, punBytesDownloaded, punBytesTotal) : false; }
+    virtual int GetAppBuildId() override { ISteamApps* r = Real(); return r ? r->GetAppBuildId() : 0; }
+    virtual void RequestAllProofOfPurchaseKeys() override { if (ISteamApps* r = Real()) r->RequestAllProofOfPurchaseKeys(); }
+    virtual SteamAPICall_t GetFileDetails(const char* pszFileName) override { ISteamApps* r = Real(); return r ? r->GetFileDetails(pszFileName) : k_uAPICallInvalid; }
+    virtual int GetLaunchCommandLine(char *pszCommandLine, int cubCommandLine) override { ISteamApps* r = Real(); return r ? r->GetLaunchCommandLine(pszCommandLine, cubCommandLine) : 0; }
     virtual bool BIsSubscribedFromFamilySharing() override { return false; }
     virtual bool BIsTimedTrial(uint32* punSecondsAllowed, uint32* punSecondsPlayed) override { return false; }
-    virtual bool SetDlcContext(AppId_t nAppID) override { return false; }
-    virtual int GetNumBetas(int* pnAvailable, int* pnPrivate) override { return 0; }
-    virtual bool GetBetaInfo(int iBetaIndex, uint32 *punFlags, uint32 *punBuildID, char *pchBetaName, int cchBetaName, char *pchDescription, int cchDescription) override { return false; }
-    virtual bool SetActiveBeta(const char *pchBetaName) override { return false; }
+    virtual bool SetDlcContext(AppId_t nAppID) override { ISteamApps* r = Real(); return r ? r->SetDlcContext(nAppID) : false; }
+    virtual int GetNumBetas(int* pnAvailable, int* pnPrivate) override { ISteamApps* r = Real(); return r ? r->GetNumBetas(pnAvailable, pnPrivate) : 0; }
+    virtual bool GetBetaInfo(int iBetaIndex, uint32 *punFlags, uint32 *punBuildID, char *pchBetaName, int cchBetaName, char *pchDescription, int cchDescription) override {
+        ISteamApps* r = Real(); return r ? r->GetBetaInfo(iBetaIndex, punFlags, punBuildID, pchBetaName, cchBetaName, pchDescription, cchDescription) : false;
+    }
+    virtual bool SetActiveBeta(const char *pchBetaName) override { ISteamApps* r = Real(); return r ? r->SetActiveBeta(pchBetaName) : false; }
 
 private:
-    static CSteamAppsStub s_AppsStub;
+    static ISteamApps* Real() { return g_ClientCtx.SteamApps(); }
 };
 
 std::vector<uint32> CSteamAppsStub::s_UnlockedDLCAppIds;
@@ -385,6 +461,8 @@ uint32 CSteamUserStub::s_unEmulatedAppId = 0;
 std::vector<uint8_t> CSteamUserStub::s_EncryptedTicket;
 CSteamAppsStub s_AppsStub;
 CSteamUserStub s_UserStub;
+
+inline ISteamUser* CSteamUserStub::Real() { return g_ClientCtx.SteamUser(); }
 
 inline uint32 CSteamUserStub::GenerateFakeTicket(uint8_t* pTicket, uint32 cbMaxTicket, void* pDataToInclude, int cbDataToInclude)
 {

@@ -5,23 +5,9 @@ bool GetSteamPathFromRegistry(char* outPath, size_t pathSize);
 
 uint32 CountRegisteredCallbacks(int iCallbackId)
 {
-	uint32 count = 0;
-
-	if (s_bDispatcherInited)
-	{
-		CCallbackDispatcher* pDisp = GetDispatcher();
-
-		if (!pDisp->m_CallbackMap.empty())
-		{
-			for (auto it = pDisp->m_CallbackMap.begin(); it != pDisp->m_CallbackMap.end(); ++it)
-			{
-				if (it->first == iCallbackId)
-					count++;
-			}
-		}
-	}
-
-	KRYOTOLOG("[KryotoOnline] CountRegisteredCallbacks -> %d = %u\r\n", iCallbackId, count);
+	// Steam asks this before posting some callbacks at all, so a wrong
+	// zero here silently drops messages a listener is waiting for.
+	uint32 count = s_bDispatcherInited ? GetDispatcher()->CountRegistered(iCallbackId) : 0;
 	return count;
 }
 
@@ -38,6 +24,28 @@ static void WarnMissingInterface(HSteamPipe hPipe, const char* iface)
 extern uint32 g_ForcedAppId;
 extern uint32 g_OriginalAppId;
 static bool s_bAnonUser = false;
+
+// The core's view of the live client: any interface by version string,
+// against the pipe being hooked. ISteamUtils hangs off the pipe rather
+// than a user, so it is asked for with user 0, as DoFrame does.
+static HSteamUser UserForInterface(const char* version, HSteamUser user)
+{
+	return _strnicmp(version, "SteamUtils", 10) == 0 ? 0 : user;
+}
+
+static void* __cdecl ResolveClientInterface(const char* version)
+{
+	if (!version || !g_pSteamClient || g_ClientPipe == 0)
+		return nullptr;
+	return g_pSteamClient->GetISteamGenericInterface(UserForInterface(version, g_ClientUser), g_ClientPipe, version);
+}
+
+static void* __cdecl ResolveServerInterface(const char* version)
+{
+	if (!version || !g_ServerClient || g_ServerPipe == 0)
+		return nullptr;
+	return g_ServerClient->GetISteamGenericInterface(UserForInterface(version, g_ServerUser), g_ServerPipe, version);
+}
 
 static void SetAppIDEnv()
 {
@@ -324,7 +332,7 @@ S_API ESteamAPIInitResult S_CALLTYPE SteamInternal_SteamAPI_Init(const char* psz
 				// Now, not at DLL_PROCESS_ATTACH: these hook vtable
 				// slots on the live client's interfaces, and those
 				// objects do not exist until this call resolved them.
-				s_Core.InstallSpoofHooks(g_ClientCtx.SteamUtils(), g_ClientCtx.SteamApps());
+				s_Core.InstallHooks(&ResolveClientInterface, false);
 
 				// Build the plugin context now that Steam interfaces
 				// are resolved, then let each plugin install its

@@ -42,7 +42,16 @@ S_API ESteamAPIInitResult S_CALLTYPE SteamInternal_GameServer_Init_V2(uint32 unI
 				if (eMode == eServerModeAuthenticationAndSecure) flags |= k_unServerFlagSecure;
 				if (eMode == eServerModeNoAuthentication) flags |= k_unServerFlagPrivate;
 
-				uint32 appId = pUtils->GetAppID();
+				// The spoofed AppId, never what GetAppID says. Once the
+				// client is up, GetAppID is hooked to report ogAppId, and
+				// a server registered under ogAppId is one no client on
+				// the spoofed id can find, join or authenticate against.
+				// The client side has always been the forced id; the
+				// server has to be the same one.
+				uint32 appId = g_ForcedAppId;
+				uint32 reportedId = pUtils->GetAppID();
+				if (reportedId != appId)
+					KRYOTOLOG("[KryotoOnline] GameServer_Init: registering as %u (utils reports %u)\r\n", appId, reportedId);
 
 				if (appId != 0)
 				{
@@ -65,6 +74,11 @@ S_API ESteamAPIInitResult S_CALLTYPE SteamInternal_GameServer_Init_V2(uint32 unI
 						g_pServerUtils = g_ServerCtx.SteamGameServerUtils();
 						g_pSteamClientGameServer = g_ServerClient;
 						g_pSteamClientGameServer_Latest = g_ServerClient;
+
+						// The server pipe hands out its own ISteamGameServer,
+						// whose UserHasLicenseForApp is what a dedicated or
+						// listen server asks about each joining player.
+						s_Core.InstallHooks(&ResolveServerInterface, true);
 
 						return k_ESteamAPIInitResult_OK;
 					}

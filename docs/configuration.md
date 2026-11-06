@@ -52,6 +52,9 @@ PluginsFolder=plugins
 GetStubbedLol=false
 UnlockDLC=123,456,789
 EmulateTicket=true
+LobbyIsolation=true
+LobbyWorldwide=true
+LobbyTag=
 ```
 
 | Key | What it does |
@@ -61,7 +64,10 @@ EmulateTicket=true
 | `PluginsFolder` | Folder of extra DLLs to load, relative to the executable. |
 | `GetStubbedLol` | Defeat SteamStub at runtime. See below. |
 | `UnlockDLC` | Comma-separated AppIDs to report as owned and installed. |
-| `EmulateTicket` | Emulate auth tickets. Needed by games that verify a session ticket. |
+| `EmulateTicket` | Emulate the encrypted app ticket. Everything else on `ISteamUser` (SteamID, session tickets, auth) still goes to the real client. |
+| `LobbyIsolation` | Tag this game's lobbies and filter every lobby search on the tag. Default `true`. See below. |
+| `LobbyWorldwide` | Search lobbies worldwide unless the game picks a distance itself. Default `true`. |
+| `LobbyTag` | What the lobbies are tagged with. Default: `ogAppId`, or the exe name when there is none. |
 
 **Without this file nothing is configured.** The core reports that on its
 first log line and every setting takes its default: AppID 480 with no
@@ -93,6 +99,40 @@ signature that is not there. Set it to `true` only for a build whose exe
 is still wrapped.
 
 Original runtime approach from DenuvoSanctuary, in Rust; rewritten here.
+
+## Multiplayer on a shared AppId
+
+Every game spoofed as Spacewar is, as far as Steam is concerned, the same
+game. They share one lobby pool, one server list and one "playing" status,
+and the core corrects for each:
+
+- **Lobbies.** A lobby search returns at most 50 results, nearest first,
+  from a pool every other Spacewar-spoofed game is also filling. A game
+  that does not filter on its own key lists other titles' lobbies (and
+  can join them); one that does gets nothing once the pool is busy. So a
+  lobby this game creates is tagged `kryoto_app=<LobbyTag>`, every
+  `RequestLobbyList` is filtered on that pair, and the search is widened
+  to worldwide unless the game asked for a distance itself. Joining by
+  invite, by friend or by lobby id is unaffected.
+
+  **Everyone has to be on 1.10 or newer**, with the same `LobbyTag` (the
+  default, `ogAppId`, already agrees between two copies of one game). A
+  host on an older release creates untagged lobbies that a 1.10 search
+  will not list. Set `LobbyIsolation=false` to go back to the raw pool.
+
+- **Friends.** `GetFriendGamePlayed` reports a friend on the spoofed AppId
+  as playing `ogAppId`, which is what the game compares against, so Join
+  buttons and in-game friend lists work.
+
+- **Dedicated and listen servers.** The game server always registers
+  under the spoofed AppId, so clients can find and authenticate against
+  it, and a server-browser request for `ogAppId` is sent to the spoofed
+  one. `UserHasLicenseForApp` answers yes for the game and its configured
+  DLC on both the client and the server side, so hosts stop kicking
+  players for "not owning" a game nobody in the session owns.
+
+None of this applies when `ogAppId` equals `AppId`: then the game runs as
+itself and has its own pools already.
 
 ## Plugins
 

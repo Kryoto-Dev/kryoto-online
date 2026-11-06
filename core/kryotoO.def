@@ -11,6 +11,6 @@ EXPORTS
     KryotoO_AbiVersion
     KryotoO_Startup
     KryotoO_LoadPlugins
-    KryotoO_InstallSpoofHooks
+    KryotoO_InstallHooks
     KryotoO_InitPlugins
     KryotoO_Shutdown

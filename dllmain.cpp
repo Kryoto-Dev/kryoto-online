@@ -320,6 +320,7 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 		const KryotoO_Config& cfg = s_Core.Config();
 		g_ForcedAppId = cfg.AppId;
 		g_OriginalAppId = cfg.OgAppId;
+		KryotoLobby::SetTag(cfg.LobbyIsolation != 0, cfg.LobbyTagKey, cfg.LobbyTagValue);
 
 		SetAppIDEnv();
 		WriteAppIDFile();
@@ -398,8 +399,6 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 // CCallbackDispatcher
 // ============================================================
 
-static bool s_bDispatcherReady = false;
-
 // ============================================================
 // Callback patcher registry
 //
@@ -443,6 +442,41 @@ static void RunCallbackPatchers(int iCallback, uint8* pBuf, uint32 cbBuf)
     ReleaseSRWLockShared(&g_CallbackPatcherLock);
 }
 
+// ============================================================
+// What changed in 1.10, because every item was a multiplayer bug:
+//
+//   * ONE message per RunCallbacks. The pipe was read once a frame,
+//     so on joining a lobby - where Steam posts a PersonaStateChange
+//     per member, a LobbyDataUpdate per key and a LobbyChatUpdate per
+//     join - the message the game was waiting for sat behind dozens
+//     of others, a frame each. Timeouts, "failed to join", hosts that
+//     never saw a client arrive. Valve's dispatcher drains the pipe;
+//     this one now does too.
+//
+//   * ONE listener per callback. Dispatch stopped at the first
+//     registered CCallback for an id. Games register several - the
+//     lobby UI, the network layer and the voice system all listen
+//     for LobbyChatUpdate_t - and all but one went deaf.
+//
+//   * Pipe-wide callbacks dropped. A message was delivered only if
+//     its m_hSteamUser was the client user. ISteamUtils' callbacks
+//     (SteamShutdown_t, GamepadTextInputDismissed_t, ...) are posted
+//     for the pipe with user 0 and never arrived.
+//
+//   * Unregistering never happened. Every SteamAPI_Unregister* was
+//     gated on a flag nothing ever set, so a destroyed CCallback (a
+//     scene change, leaving a lobby menu) stayed in the map and the
+//     next matching message called into freed memory.
+//
+//   * Call results were never retired. The entry stayed in the map
+//     after firing, its buffer leaked, and the next completion walked
+//     a list of dangling pointers. A failed GetAPICallResult deleted
+//     the buffer and told the game nothing, so a join that failed at
+//     the Steam end waited forever. And if a handler registered a new
+//     callback, every LobbyEnter_t listener in the game was erased
+//     and the call result was run a second time.
+// ============================================================
+
 CCallbackDispatcher::CCallbackDispatcher()
 {
 	KryotoColor(FOREGROUND_BLUE | FOREGROUND_INTENSITY, "[KryotoOnline] CCallbackDispatcher constructed\r\n");
@@ -454,34 +488,25 @@ CCallbackDispatcher::CCallbackDispatcher()
 	m_ManualCbId = 0;
 	m_ManualCbSize = 0;
 	m_bProcessing = false;
-	m_CallbackMap.clear();
-	m_CallResultMap.clear();
-	m_BufferMap.clear();
-	s_bDispatcherReady = true;
+	InitializeSRWLock(&m_MapLock);
+
+	// The flag every Unregister and CountRegisteredCallbacks checks.
+	// Nothing used to set it.
+	s_bDispatcherInited = true;
 }
 
 CCallbackDispatcher::~CCallbackDispatcher()
 {
-	KryotoColor(FOREGROUND_BLUE | FOREGROUND_INTENSITY, "[KryotoOnline] CCallbackDispatcher destroyed\r\n");
-
-	s_bDispatcherReady = false;
+	s_bDispatcherInited = false;
 	m_pfnBGetCallback = nullptr;
 	m_pfnFreeLastCallback = nullptr;
 	m_pfnGetAPICallResult = nullptr;
-	m_CurrentUser = 0;
-	m_ManualCbId = 0;
-	m_ManualCbSize = 0;
-	m_bProcessing = false;
-	m_CallbackMap.clear();
-	m_CallResultMap.clear();
-	m_BufferMap.clear();
 }
 
 void CCallbackDispatcher::Shutdown()
 {
 	KryotoColor(FOREGROUND_BLUE | FOREGROUND_INTENSITY, "[KryotoOnline] CCallbackDispatcher shutdown\r\n");
 
-	s_bDispatcherReady = false;
 	m_pfnBGetCallback = nullptr;
 	m_pfnFreeLastCallback = nullptr;
 	m_pfnGetAPICallResult = nullptr;
@@ -489,190 +514,211 @@ void CCallbackDispatcher::Shutdown()
 	m_ManualCbId = 0;
 	m_ManualCbSize = 0;
 	m_bProcessing = false;
-	m_CallbackMap.clear();
+
+	// Pending call results die with the pipe that would have answered
+	// them. Registered callbacks do NOT: they belong to game objects
+	// that outlive a SteamAPI_Shutdown/SteamAPI_Init cycle, and those
+	// objects unregister themselves when they are destroyed.
+	AcquireSRWLockExclusive(&m_MapLock);
+	for (auto& e : m_CallResultMap)
+		e.second->m_nCallbackFlags &= ~CCallbackBase::k_ECallbackFlagsRegistered;
 	m_CallResultMap.clear();
-	m_BufferMap.clear();
+	ReleaseSRWLockExclusive(&m_MapLock);
 }
 
-void CCallbackDispatcher::ExecuteCallResult(HSteamPipe hPipe, SteamAPICall_t hCall, CCallbackBase* pCb)
+bool CCallbackDispatcher::StillRegistered(int iCallback, CCallbackBase* pCb)
 {
-	KRYOTOLOG("[KryotoOnline] ExecuteCallResult -> call=%lld cb=%d size=%d\r\n", hCall, pCb->GetICallback(), pCb->GetCallbackSizeBytes());
-
-	BYTE* pBuffer = new BYTE[pCb->GetCallbackSizeBytes()]();
-	bool bFailed = false;
-
-	bool bResult = m_pfnGetAPICallResult(hPipe, hCall, pBuffer, pCb->GetCallbackSizeBytes(), pCb->GetICallback(), &bFailed);
-
-	if (bResult && !bFailed)
+	bool found = false;
+	AcquireSRWLockShared(&m_MapLock);
+	auto range = m_CallbackMap.equal_range(iCallback);
+	for (auto it = range.first; it != range.second; ++it)
 	{
-		size_t countBefore = m_CallbackMap.size();
-
-		KryotoLobby::OnCallback(pCb->GetICallback(), pBuffer, pCb->GetCallbackSizeBytes());
-		pCb->Run(pBuffer, bFailed, hCall);
-
-		if (countBefore != m_CallbackMap.size())
+		if (it->second == pCb)
 		{
-			KryotoColor(FOREGROUND_BLUE | FOREGROUND_INTENSITY, "[KryotoOnline] Callback map changed during CallResult execution\r\n");
-
-			m_CallbackMap.erase(LobbyEnter_t::k_iCallback);
-			pCb->Run(pBuffer);
+			found = true;
+			break;
 		}
+	}
+	ReleaseSRWLockShared(&m_MapLock);
+	return found;
+}
 
-		m_BufferMap.insert(std::make_pair(hCall, pBuffer));
+uint32 CCallbackDispatcher::CountRegistered(int iCallback)
+{
+	AcquireSRWLockShared(&m_MapLock);
+	uint32 n = (uint32)m_CallbackMap.count(iCallback);
+	ReleaseSRWLockShared(&m_MapLock);
+	return n;
+}
+
+void CCallbackDispatcher::RunCallResult(HSteamPipe hPipe, const SteamAPICallCompleted_t& done, bool bServer, bool bSafe)
+{
+	// Take it out of the map BEFORE running it, as Valve does. The
+	// handler is free to Set() the same CCallResult on a new call (a
+	// retry), and the result is one-shot either way.
+	CCallbackBase* pCb = nullptr;
+	AcquireSRWLockExclusive(&m_MapLock);
+	auto it = m_CallResultMap.find(done.m_hAsyncCall);
+	if (it != m_CallResultMap.end())
+	{
+		pCb = it->second;
+		m_CallResultMap.erase(it);
+		pCb->m_nCallbackFlags &= ~CCallbackBase::k_ECallbackFlagsRegistered;
+	}
+	ReleaseSRWLockExclusive(&m_MapLock);
+
+	if (!pCb)
+		return;
+
+	// Size the buffer for whichever is larger: what the client has
+	// (m_cubParam) or what the game's struct expects. A game built
+	// against an older SDK can expect a few bytes less or more; the
+	// client is asked for exactly what it holds, and the game reads
+	// its own struct out of a buffer at least that big.
+	int cbGame = pCb->GetCallbackSizeBytes();
+	size_t cbAlloc = (size_t)(cbGame > (int)done.m_cubParam ? cbGame : (int)done.m_cubParam);
+	if (cbAlloc == 0)
+		cbAlloc = 1;
+	std::vector<uint8> buffer(cbAlloc, 0);
+
+	bool bFailed = false;
+	if (pCb->GetICallback() != done.m_iCallback)
+	{
+		KRYOTOLOG("[KryotoOnline] Call result %llu: game expects %d, client completed %d\r\n",
+			(unsigned long long)done.m_hAsyncCall, pCb->GetICallback(), done.m_iCallback);
+		bFailed = true;
+	}
+	else if (!m_pfnGetAPICallResult(hPipe, done.m_hAsyncCall, buffer.data(), (int)done.m_cubParam, done.m_iCallback, &bFailed))
+	{
+		bFailed = true;
+	}
+
+	if (!bFailed && !bServer)
+		KryotoLobby::OnCallback(done.m_iCallback, buffer.data(), (int)done.m_cubParam);
+
+	KRYOTOLOG("[KryotoOnline] Call result -> call=%llu cb=%d failed=%d\r\n",
+		(unsigned long long)done.m_hAsyncCall, done.m_iCallback, (int)bFailed);
+
+	// Delivered failed or not. A CCallResult that is never run is a
+	// game waiting forever on a join or a lobby list.
+	if (bSafe)
+	{
+		try { pCb->Run(buffer.data(), bFailed, done.m_hAsyncCall); }
+		catch (...) { KryotoColor(FOREGROUND_RED | FOREGROUND_INTENSITY, "[KryotoOnline] Exception in call result\r\n"); }
 	}
 	else
 	{
-		KryotoColor(FOREGROUND_RED | FOREGROUND_INTENSITY, "[KryotoOnline] GetAPICallResult failed\r\n");
-		delete[] pBuffer;
+		pCb->Run(buffer.data(), bFailed, done.m_hAsyncCall);
 	}
 }
 
-void CCallbackDispatcher::DispatchFrame(HSteamPipe hPipe, bool bServer)
+void CCallbackDispatcher::DispatchOne(HSteamPipe hPipe, const CallbackMsg_t& msg, bool bServer, bool bSafe)
+{
+	m_CurrentUser = msg.m_hSteamUser;
+
+	if (!bServer)
+		KryotoLobby::OnCallback(msg.m_iCallback, msg.m_pubParam, msg.m_cubParam);
+
+	if (msg.m_iCallback == SteamAPICallCompleted_t::k_iCallback && msg.m_cubParam >= (int)sizeof(SteamAPICallCompleted_t))
+	{
+		SteamAPICallCompleted_t done;
+		memcpy(&done, msg.m_pubParam, sizeof(done));
+		RunCallResult(hPipe, done, bServer, bSafe);
+		return;
+	}
+
+	// The overlay's 1x1 placeholder paints; HTML surfaces handle the
+	// real ones.
+	if (msg.m_iCallback == HTML_NeedsPaint_t::k_iCallback && msg.m_cubParam == (int)sizeof(HTML_NeedsPaint_t))
+	{
+		const HTML_NeedsPaint_t* pPaint = (const HTML_NeedsPaint_t*)msg.m_pubParam;
+		if (pPaint->unWide == 1 || pPaint->unTall == 1)
+			return;
+	}
+
+	// Snapshot the listeners, then call them without the lock. A
+	// handler may register or unregister anything, itself included;
+	// each listener is re-checked against the live map just before it
+	// runs so one that was removed meanwhile is not called.
+	CCallbackBase* local[16];
+	std::vector<CCallbackBase*> heap;
+	size_t count = 0;
+
+	AcquireSRWLockShared(&m_MapLock);
+	auto range = m_CallbackMap.equal_range(msg.m_iCallback);
+	for (auto it = range.first; it != range.second; ++it)
+	{
+		CCallbackBase* pCb = it->second;
+		if (!(pCb->m_nCallbackFlags & CCallbackBase::k_ECallbackFlagsRegistered))
+			continue;
+
+		// Game-server listeners hear the server pipe, everyone else the
+		// client pipe - the same split Valve's dispatcher makes.
+		bool bServerListener = (pCb->m_nCallbackFlags & CCallbackBase::k_ECallbackFlagsGameServer) != 0;
+		if (bServerListener != bServer)
+			continue;
+
+		if (count < _countof(local))
+			local[count] = pCb;
+		else
+		{
+			if (heap.empty())
+				heap.assign(local, local + count);
+			heap.push_back(pCb);
+		}
+		++count;
+	}
+	ReleaseSRWLockShared(&m_MapLock);
+
+	if (count == 0)
+		return;
+
+	CCallbackBase** listeners = heap.empty() ? local : heap.data();
+
+	if (!bServer)
+		RunCallbackPatchers(msg.m_iCallback, msg.m_pubParam, (uint32)msg.m_cubParam);
+
+	for (size_t i = 0; i < count; ++i)
+	{
+		CCallbackBase* pCb = listeners[i];
+		if (i > 0 && !StillRegistered(msg.m_iCallback, pCb))
+			continue;
+
+		if (bSafe)
+		{
+			try { pCb->Run(msg.m_pubParam); }
+			catch (...) { KryotoColor(FOREGROUND_RED | FOREGROUND_INTENSITY, "[KryotoOnline] Exception in callback dispatch\r\n"); }
+		}
+		else
+		{
+			pCb->Run(msg.m_pubParam);
+		}
+	}
+}
+
+void CCallbackDispatcher::DispatchFrame(HSteamPipe hPipe, bool bServer, bool bSafe)
 {
 	if (!m_pfnBGetCallback || !m_pfnFreeLastCallback || !m_pfnGetAPICallResult)
 		return;
 
-	CallbackMsg_t msg = { 0 };
-	if (!m_pfnBGetCallback(hPipe, &msg))
-		return;
-
-	KRYOTOLOG("[KryotoOnline] Callback received -> %d\r\n", msg.m_iCallback);
-	m_CurrentUser = msg.m_hSteamUser;
-	if (!bServer)
-		KryotoLobby::OnCallback(msg.m_iCallback, msg.m_pubParam, msg.m_cubParam);
-
-	if (msg.m_iCallback == SteamAPICallCompleted_t::k_iCallback && msg.m_cubParam == sizeof(SteamAPICallCompleted_t))
+	// Bounded only so a handler that makes Steam post a callback
+	// synchronously cannot spin this forever; no real frame gets near it.
+	for (int guard = 0; guard < 8192; ++guard)
 	{
-		SteamAPICallCompleted_t* pCompleted = (SteamAPICallCompleted_t*)msg.m_pubParam;
-
-		if (!m_CallResultMap.empty())
-		{
-			for (auto it = m_CallResultMap.begin(); it != m_CallResultMap.end(); ++it)
-			{
-				if (pCompleted->m_hAsyncCall == it->first &&
-					pCompleted->m_iCallback == it->second->GetICallback() &&
-					pCompleted->m_cubParam == (uint32)it->second->GetCallbackSizeBytes())
-				{
-					ExecuteCallResult(hPipe, it->first, it->second);
-				}
-			}
-		}
-	}
-	else
-	{
-		if (!m_CallbackMap.empty())
-		{
-			for (auto it = m_CallbackMap.begin(); it != m_CallbackMap.end(); ++it)
-			{
-				CCallbackBase* pCb = it->second;
-
-				if (it->first == msg.m_iCallback && (pCb->m_nCallbackFlags & pCb->k_ECallbackFlagsRegistered))
-				{
-					if (msg.m_hSteamUser == g_ServerUser && (pCb->m_nCallbackFlags & pCb->k_ECallbackFlagsGameServer) && bServer)
-					{
-						KRYOTOLOG("[KryotoOnline] Server callback -> %d flags=%d\r\n", msg.m_iCallback, pCb->m_nCallbackFlags);
-						pCb->Run(msg.m_pubParam);
-						break;
-					}
-					else if (msg.m_hSteamUser == g_ClientUser && !(pCb->m_nCallbackFlags & pCb->k_ECallbackFlagsGameServer) && !bServer)
-					{
-						KRYOTOLOG("[KryotoOnline] Client callback -> %d flags=%d\r\n", msg.m_iCallback, pCb->m_nCallbackFlags);
-
-						bool bSkip = false;
-
-						if (msg.m_iCallback == HTML_NeedsPaint_t::k_iCallback && msg.m_cubParam == sizeof(HTML_NeedsPaint_t))
-						{
-							HTML_NeedsPaint_t* pPaint = (HTML_NeedsPaint_t*)msg.m_pubParam;
-							if (pPaint->unWide == 1 || pPaint->unTall == 1)
-								bSkip = true;
-						}
-
-						RunCallbackPatchers(msg.m_iCallback, msg.m_pubParam, msg.m_cubParam);
-
-						if (!bSkip)
-							pCb->Run(msg.m_pubParam);
-
-						break;
-					}
-				}
-			}
-		}
-	}
-
-	KRYOTOLOG("[KryotoOnline] Freeing callback -> %d\r\n", msg.m_iCallback);
-	SecureZeroMemory(msg.m_pubParam, msg.m_cubParam);
-	m_pfnFreeLastCallback(hPipe);
-}
-
-void CCallbackDispatcher::DispatchFrameSafe(HSteamPipe hPipe, bool bServer)
-{
-	try
-	{
-		if (!m_pfnBGetCallback || !m_pfnFreeLastCallback || !m_pfnGetAPICallResult)
-			return;
-
 		CallbackMsg_t msg = { 0 };
 		if (!m_pfnBGetCallback(hPipe, &msg))
-			return;
+			break;
 
-		KRYOTOLOG("[KryotoOnline] Callback (safe) -> %d\r\n", msg.m_iCallback);
-		m_CurrentUser = msg.m_hSteamUser;
-		if (!bServer)
-			KryotoLobby::OnCallback(msg.m_iCallback, msg.m_pubParam, msg.m_cubParam);
-
-		if (msg.m_iCallback == SteamAPICallCompleted_t::k_iCallback && msg.m_cubParam == sizeof(SteamAPICallCompleted_t))
-		{
-			SteamAPICallCompleted_t* pCompleted = (SteamAPICallCompleted_t*)msg.m_pubParam;
-
-			if (!m_CallResultMap.empty())
-			{
-				for (auto it = m_CallResultMap.begin(); it != m_CallResultMap.end(); ++it)
-				{
-					if (pCompleted->m_hAsyncCall == it->first &&
-						pCompleted->m_iCallback == it->second->GetICallback() &&
-						pCompleted->m_cubParam == (uint32)it->second->GetCallbackSizeBytes())
-					{
-						ExecuteCallResult(hPipe, it->first, it->second);
-					}
-				}
-			}
-		}
-		else
-		{
-			if (!m_CallbackMap.empty())
-			{
-				for (auto it = m_CallbackMap.begin(); it != m_CallbackMap.end(); ++it)
-				{
-					CCallbackBase* pCb = it->second;
-
-					if (it->first == msg.m_iCallback && (pCb->m_nCallbackFlags & pCb->k_ECallbackFlagsRegistered))
-					{
-						if (msg.m_hSteamUser == g_ServerUser && (pCb->m_nCallbackFlags & pCb->k_ECallbackFlagsGameServer) && bServer)
-						{
-							KRYOTOLOG("[KryotoOnline] Server callback (safe) -> %d flags=%d\r\n", msg.m_iCallback, pCb->m_nCallbackFlags);
-							pCb->Run(msg.m_pubParam);
-							break;
-						}
-						else if (msg.m_hSteamUser == g_ClientUser && !(pCb->m_nCallbackFlags & pCb->k_ECallbackFlagsGameServer) && !bServer)
-						{
-							KRYOTOLOG("[KryotoOnline] Client callback (safe) -> %d flags=%d\r\n", msg.m_iCallback, pCb->m_nCallbackFlags);
-							RunCallbackPatchers(msg.m_iCallback, msg.m_pubParam, msg.m_cubParam);
-							pCb->Run(msg.m_pubParam);
-							break;
-						}
-					}
-				}
-			}
-		}
-
-		KRYOTOLOG("[KryotoOnline] Freeing callback (safe) -> %d\r\n", msg.m_iCallback);
-		SecureZeroMemory(msg.m_pubParam, msg.m_cubParam);
+		DispatchOne(hPipe, msg, bServer, bSafe);
 		m_pfnFreeLastCallback(hPipe);
+
+		// SteamAPI_Shutdown from inside a handler pulls the pipe out
+		// from under the loop.
+		if (!m_pfnBGetCallback || !m_pfnFreeLastCallback)
+			break;
 	}
-	catch (...)
-	{
-		KryotoColor(FOREGROUND_RED | FOREGROUND_INTENSITY, "[KryotoOnline] Exception in callback dispatch\r\n");
-	}
+
+	m_CurrentUser = 0;
 }
 
 void CCallbackDispatcher::Add(CCallbackBase* pCb, int iCallback)
@@ -688,9 +734,22 @@ void CCallbackDispatcher::Add(CCallbackBase* pCb, int iCallback)
 
 	KRYOTOLOG("[KryotoOnline] Register callback -> %d size=%d flags=%d\r\n", iCallback, pCb->GetCallbackSizeBytes(), pCb->m_nCallbackFlags);
 
-	pCb->m_nCallbackFlags |= pCb->k_ECallbackFlagsRegistered;
+	AcquireSRWLockExclusive(&m_MapLock);
+
+	// Registering twice must not mean being called twice.
+	for (auto it = m_CallbackMap.begin(); it != m_CallbackMap.end(); )
+	{
+		if (it->second == pCb)
+			it = m_CallbackMap.erase(it);
+		else
+			++it;
+	}
+
+	pCb->m_nCallbackFlags |= CCallbackBase::k_ECallbackFlagsRegistered;
 	pCb->m_iCallback = iCallback;
 	m_CallbackMap.insert(std::make_pair(iCallback, pCb));
+
+	ReleaseSRWLockExclusive(&m_MapLock);
 }
 
 void CCallbackDispatcher::AddCallResult(CCallbackBase* pCb, SteamAPICall_t hCall)
@@ -707,76 +766,62 @@ void CCallbackDispatcher::AddCallResult(CCallbackBase* pCb, SteamAPICall_t hCall
 		return;
 	}
 
-	KRYOTOLOG("[KryotoOnline] Register call result -> %lld cb=%d size=%d\r\n", hCall, pCb->GetICallback(), pCb->GetCallbackSizeBytes());
+	KRYOTOLOG("[KryotoOnline] Register call result -> %llu cb=%d size=%d\r\n",
+		(unsigned long long)hCall, pCb->GetICallback(), pCb->GetCallbackSizeBytes());
 
-	pCb->m_nCallbackFlags |= pCb->k_ECallbackFlagsRegistered;
-
-	auto existing = m_CallResultMap.find(hCall);
-	if (existing == m_CallResultMap.end())
-	{
-		m_CallResultMap.insert(std::make_pair(hCall, pCb));
-	}
-	else
-	{
-		KryotoColor(FOREGROUND_RED | FOREGROUND_INTENSITY, "[KryotoOnline] AddCallResult: already registered\r\n");
-		existing->second = pCb;
-	}
+	AcquireSRWLockExclusive(&m_MapLock);
+	pCb->m_nCallbackFlags |= CCallbackBase::k_ECallbackFlagsRegistered;
+	m_CallResultMap[hCall] = pCb;
+	ReleaseSRWLockExclusive(&m_MapLock);
 }
 
 void CCallbackDispatcher::Remove(CCallbackBase* pCb)
 {
 	if (!pCb)
-	{
-		KryotoColor(FOREGROUND_RED | FOREGROUND_INTENSITY, "[KryotoOnline] Remove: null callback ptr\r\n");
-		return;
-	}
-
-	if (!(pCb->m_nCallbackFlags & pCb->k_ECallbackFlagsRegistered))
-	{
-		KryotoColor(FOREGROUND_RED | FOREGROUND_INTENSITY, "[KryotoOnline] Remove: not registered\r\n");
-		return;
-	}
-
-	if (m_CallbackMap.empty())
 		return;
 
-	KRYOTOLOG("[KryotoOnline] Unregister callback -> %d flags=%d\r\n", pCb->GetICallback(), pCb->m_nCallbackFlags);
-	pCb->m_nCallbackFlags &= ~pCb->k_ECallbackFlagsRegistered;
-
-	for (auto it = m_CallbackMap.begin(); it != m_CallbackMap.end(); ++it)
+	AcquireSRWLockExclusive(&m_MapLock);
+	pCb->m_nCallbackFlags &= ~CCallbackBase::k_ECallbackFlagsRegistered;
+	for (auto it = m_CallbackMap.begin(); it != m_CallbackMap.end(); )
 	{
 		if (it->second == pCb)
-		{
-			m_CallbackMap.erase(it);
-			break;
-		}
+			it = m_CallbackMap.erase(it);
+		else
+			++it;
 	}
+	ReleaseSRWLockExclusive(&m_MapLock);
+
+	KRYOTOLOG("[KryotoOnline] Unregister callback -> %d\r\n", pCb->GetICallback());
 }
 
 void CCallbackDispatcher::RemoveCallResult(CCallbackBase* pCb, SteamAPICall_t hCall)
 {
-	if (!pCb || hCall == k_uAPICallInvalid)
-	{
-		KryotoColor(FOREGROUND_RED | FOREGROUND_INTENSITY, "[KryotoOnline] RemoveCallResult: invalid args\r\n");
+	if (!pCb)
 		return;
-	}
 
-	if (!(pCb->m_nCallbackFlags & pCb->k_ECallbackFlagsRegistered))
+	AcquireSRWLockExclusive(&m_MapLock);
+	pCb->m_nCallbackFlags &= ~CCallbackBase::k_ECallbackFlagsRegistered;
+
+	auto it = m_CallResultMap.find(hCall);
+	if (it != m_CallResultMap.end() && it->second == pCb)
 	{
-		KryotoColor(FOREGROUND_RED | FOREGROUND_INTENSITY, "[KryotoOnline] RemoveCallResult: not registered\r\n");
-		return;
+		m_CallResultMap.erase(it);
 	}
-
-	KRYOTOLOG("[KryotoOnline] Unregister call result -> %lld cb=%d flags=%d\r\n", hCall, pCb->GetICallback(), pCb->m_nCallbackFlags);
-	pCb->m_nCallbackFlags &= ~pCb->k_ECallbackFlagsRegistered;
-
-	auto bufIt = m_BufferMap.find(hCall);
-	if (bufIt != m_BufferMap.end())
+	else
 	{
-		KryotoColor(FOREGROUND_BLUE | FOREGROUND_INTENSITY, "[KryotoOnline] Freeing call result buffer\r\n");
-		delete[] bufIt->second;
-		m_BufferMap.erase(bufIt);
+		// Cancel() with a handle we do not have under that object: drop
+		// the object wherever it is, so nothing can call into it later.
+		for (auto jt = m_CallResultMap.begin(); jt != m_CallResultMap.end(); )
+		{
+			if (jt->second == pCb)
+				jt = m_CallResultMap.erase(jt);
+			else
+				++jt;
+		}
 	}
+	ReleaseSRWLockExclusive(&m_MapLock);
+
+	KRYOTOLOG("[KryotoOnline] Unregister call result -> %llu\r\n", (unsigned long long)hCall);
 }
 
 CCallbackDispatcher* GetDispatcher()

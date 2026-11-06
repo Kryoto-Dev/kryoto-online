@@ -20,6 +20,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdio.h>
 
 #include <vector>
 
@@ -81,6 +83,47 @@ public:
     /// hook scanning for a signature it will never find. Turn it on
     /// for a build whose executable is still wrapped.
     bool SteamStubEnabled() const { return ReadBool("GetStubbedLol", false); }
+
+    /// Keep this game's lobbies apart from every other title sharing
+    /// the spoofed AppId. On by default whenever there is a spoof to
+    /// speak of; see KryotoO_Config::LobbyIsolation.
+    bool LobbyIsolation() const { return ReadBool("LobbyIsolation", true); }
+
+    /// Search lobbies worldwide unless the game asked for a distance
+    /// itself. Steam's default is "nearby regions", which on a pool as
+    /// small as one cracked title is usually nobody.
+    bool LobbyWorldwide() const { return ReadBool("LobbyWorldwide", true); }
+
+    /// What this game's lobbies are tagged with: [Settings]LobbyTag,
+    /// else ogAppId, else the executable's name. Two installs only see
+    /// each other's lobbies when this matches, so the defaults are the
+    /// things two copies of one game agree on without being told.
+    void LobbyTag(char* out, size_t cch, uint32_t ogAppId) const
+    {
+        if (cch == 0) return;
+        out[0] = '\0';
+
+        if (HaveIni())
+        {
+            GetPrivateProfileStringA("Settings", "LobbyTag", "", out, (DWORD)cch, m_IniPath);
+            if (out[0] != '\0')
+                return;
+        }
+
+        if (ogAppId != 0)
+        {
+            _snprintf_s(out, cch, _TRUNCATE, "%u", ogAppId);
+            return;
+        }
+
+        char exe[MAX_PATH] = { 0 };
+        if (GetModuleFileNameA(nullptr, exe, MAX_PATH) == 0)
+            return;
+        const char* name = PathFindFileNameA(exe);
+        _snprintf_s(out, cch, _TRUNCATE, "exe:%s", name);
+        for (char* c = out; *c; ++c)
+            *c = (char)tolower((unsigned char)*c);
+    }
 
     /// Folder of plugin DLLs, relative to the executable. Empty
     /// means "load none".

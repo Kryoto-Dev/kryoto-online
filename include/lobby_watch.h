@@ -24,13 +24,22 @@
 //     vtable (which never passes through this DLL) is noticed.
 //
 // It only ever writes this one local file, and only reads what the game
-// already asked Steam for. Nothing is sent anywhere.
+// already asked Steam for.
+//
+// Lobby isolation (1.10) is the one thing here that talks to Steam: when
+// this game creates a lobby, or enters one it owns, the lobby gets one
+// metadata key, kryoto_app=<tag>. The core filters every lobby search on
+// that same pair, which is what keeps this game's lobbies findable in a
+// Spacewar pool shared with every other game spoofed onto it. The tag is
+// the game's ogAppId (or [Settings]LobbyTag), never anything about the
+// player.
 
 #pragma once
 
 #include <Windows.h>
 #include <stdio.h>
 #include <time.h>
+#include <string.h>
 
 namespace KryotoLobby
 {
@@ -43,6 +52,20 @@ namespace KryotoLobby
 	static const ULONGLONG kCheckMs = 5000;      // membership check
 	static const ULONGLONG kHeartbeatMs = 30000; // updatedAt refresh
 	static const ULONGLONG kGraceMs = 10000;     // member list fills in after entering
+
+	// Lobby isolation: set once at startup from the core's config.
+	static bool s_TagOn = false;
+	static char s_TagKey[32] = { 0 };
+	static char s_TagValue[64] = { 0 };
+
+	static void SetTag(bool on, const char* key, const char* value)
+	{
+		s_TagOn = on && key && key[0] && value && value[0];
+		if (!s_TagOn)
+			return;
+		strncpy_s(s_TagKey, sizeof(s_TagKey), key, _TRUNCATE);
+		strncpy_s(s_TagValue, sizeof(s_TagValue), value, _TRUNCATE);
+	}
 
 	// %LOCALAPPDATA%\Kryoto\online\<pid>.json, creating the folders. False
 	// when there is no LOCALAPPDATA (a service account), which just means no file.
@@ -127,6 +150,39 @@ namespace KryotoLobby
 		KRYOTOLOG("[KryotoOnline] Lobby: left\r\n");
 	}
 
+	// Write this game's tag onto a lobby it owns, so other copies of the
+	// game find it through the core's filtered RequestLobbyList. Only the
+	// owner can set lobby data, and only a lobby without the tag (or with
+	// a different one) is written, so a LobbyCreated_t that arrives as both
+	// a callback and a call result costs one SetLobbyData, not two.
+	static void Tag(uint64 lobby, bool knownOwner)
+	{
+		if (!s_TagOn || lobby == 0)
+			return;
+
+		ISteamMatchmaking* pMM = g_ClientCtx.SteamMatchmaking();
+		if (!pMM)
+			return;
+
+		CSteamID id(lobby);
+		if (!knownOwner)
+		{
+			uint64 self = SelfSteamId();
+			if (self == 0 || pMM->GetLobbyOwner(id).ConvertToUint64() != self)
+				return;
+		}
+
+		const char* current = pMM->GetLobbyData(id, s_TagKey);
+		if (current && strcmp(current, s_TagValue) == 0)
+			return;
+
+		if (pMM->SetLobbyData(id, s_TagKey, s_TagValue))
+			KRYOTOLOG("[KryotoOnline] Lobby: tagged %llu %s=%s\r\n",
+				(unsigned long long)lobby, s_TagKey, s_TagValue);
+		else
+			KRYOTOLOG("[KryotoOnline] Lobby: SetLobbyData refused for %llu\r\n", (unsigned long long)lobby);
+	}
+
 	static void Entered(uint64 lobby)
 	{
 		if (lobby == 0)
@@ -151,13 +207,19 @@ namespace KryotoLobby
 		{
 			const LobbyEnter_t* e = (const LobbyEnter_t*)p;
 			if (e->m_EChatRoomEnterResponse == k_EChatRoomEnterResponseSuccess)
+			{
 				Entered(e->m_ulSteamIDLobby);
+				Tag(e->m_ulSteamIDLobby, false);
+			}
 		}
 		else if (iCallback == LobbyCreated_t::k_iCallback && cb == (int)sizeof(LobbyCreated_t))
 		{
 			const LobbyCreated_t* c = (const LobbyCreated_t*)p;
 			if (c->m_eResult == k_EResultOK)
+			{
 				Entered(c->m_ulSteamIDLobby);
+				Tag(c->m_ulSteamIDLobby, true);
+			}
 		}
 	}
 

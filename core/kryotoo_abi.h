@@ -38,7 +38,7 @@
 
 #include <stdint.h>
 
-#define KRYOTOO_ABI_VERSION 1
+#define KRYOTOO_ABI_VERSION 2
 
 // The x64 core is `kryotoO.dll`; the x86 one carries a suffix.
 //
@@ -96,7 +96,42 @@ typedef struct KryotoO_Config
     // for "I set it up and nothing happened" - the proxy logs it
     // loudly rather than letting it pass silently.
     int32_t  HaveIni;
+
+    // ---- ABI 2 -------------------------------------------------
+    //
+    // Lobby isolation. Every game spoofed as Spacewar shares one
+    // lobby pool with every other game spoofed as Spacewar, so an
+    // unfiltered RequestLobbyList fills its 50 results with other
+    // titles' lobbies and the game's own never show up. When this is
+    // on, lobbies this game owns are tagged LobbyTagKey=LobbyTagValue
+    // and every lobby search is filtered on the same pair. The core
+    // adds the filter (it hooks the client); the proxy writes the tag
+    // (it is the half that sees LobbyCreated_t / LobbyEnter_t).
+    int32_t  LobbyIsolation;    // [Settings]LobbyIsolation, default on when spoofing
+    char     LobbyTagKey[32];   // always "kryoto_app"
+    char     LobbyTagValue[64]; // [Settings]LobbyTag, else ogAppId, else the exe name
 } KryotoO_Config;
+
+// Resolve one of the live client's interfaces by version string
+// ("SteamUtils009", "SteamMatchMaking009", ...). Null when the
+// client does not know that version. Provided by the proxy, which
+// owns the pipe and user the interface has to be created against.
+typedef void* (__cdecl* KryotoO_GetInterfaceFn)(const char* version);
+
+// What the proxy hands the core to hook.
+//
+// A resolver rather than a fixed set of pointers, because a game does
+// not have to use the interface version this build was compiled
+// against. An older C++ game asks steamclient for SteamUtils009 or
+// SteamFriends017 directly, gets a different adapter with its own
+// vtable, and walks straight past a hook installed on the latest one.
+// With the resolver the core hooks every version whose layout it knows.
+typedef struct KryotoO_Interfaces
+{
+    uint32_t               StructSize;   // == sizeof(KryotoO_Interfaces)
+    KryotoO_GetInterfaceFn GetInterface;
+    int32_t                IsGameServer; // resolving against the game-server pipe
+} KryotoO_Interfaces;
 
 // ---- Exports -------------------------------------------------
 //
@@ -124,11 +159,13 @@ int32_t __cdecl KryotoO_Startup(const KryotoO_Host* host, KryotoO_Config* outCfg
 // so a plugin reading SteamAppId at load time got nothing.
 uint32_t __cdecl KryotoO_LoadPlugins(void);
 
-// Install the ownership/AppId spoof hooks on the live client's
-// vtables. Called once SteamAPI_Init has resolved them, because
-// there is nothing to hook before that. Both pointers may be null;
-// each hook is installed independently.
-void __cdecl KryotoO_InstallSpoofHooks(void* pSteamUtils, void* pSteamApps);
+// Install the spoof and lobby hooks on the live client's vtables.
+// Called once SteamAPI_Init has resolved the client, and again from
+// SteamGameServer_Init with the server pipe's resolver. Safe to call
+// any number of times: a function already hooked is skipped, and each
+// hook is installed independently, so one unknown interface version
+// costs that hook and nothing else.
+void __cdecl KryotoO_InstallHooks(const KryotoO_Interfaces* ifaces);
 
 // Hand every loaded plugin its KRYOTO_PluginContext. The struct is
 // built by the proxy (it owns the callback dispatcher the context

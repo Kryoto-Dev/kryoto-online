@@ -38,17 +38,14 @@ public:
             return false;
         }
 
+        // The version first, on its own: a core from another release is
+        // missing or renaming exports, and "speaks ABI 1, this build
+        // speaks 2" says what to do about it where "missing exports"
+        // does not.
         m_AbiVersion = (Fn_AbiVersion)GetProcAddress(m_Module, "KryotoO_AbiVersion");
-        m_Startup = (Fn_Startup)GetProcAddress(m_Module, "KryotoO_Startup");
-        m_LoadPlugins = (Fn_LoadPlugins)GetProcAddress(m_Module, "KryotoO_LoadPlugins");
-        m_InstallSpoofHooks = (Fn_InstallSpoofHooks)GetProcAddress(m_Module, "KryotoO_InstallSpoofHooks");
-        m_InitPlugins = (Fn_InitPlugins)GetProcAddress(m_Module, "KryotoO_InitPlugins");
-        m_ShutdownFn = (Fn_Shutdown)GetProcAddress(m_Module, "KryotoO_Shutdown");
-
-        if (!m_AbiVersion || !m_Startup || !m_LoadPlugins || !m_InstallSpoofHooks
-            || !m_InitPlugins || !m_ShutdownFn)
+        if (!m_AbiVersion)
         {
-            log("[KryotoOnline] %s is missing exports - ignoring it.", KRYOTOO_CORE_DLL);
+            log("[KryotoOnline] %s has no KryotoO_AbiVersion - ignoring it.", KRYOTOO_CORE_DLL);
             m_Module = nullptr;
             return false;
         }
@@ -62,6 +59,19 @@ public:
             log("[KryotoOnline] %s speaks ABI %u, this build speaks %u - ignoring it. "
                 "Ship the two files from the same release.",
                 KRYOTOO_CORE_DLL, abi, (uint32_t)KRYOTOO_ABI_VERSION);
+            m_Module = nullptr;
+            return false;
+        }
+
+        m_Startup = (Fn_Startup)GetProcAddress(m_Module, "KryotoO_Startup");
+        m_LoadPlugins = (Fn_LoadPlugins)GetProcAddress(m_Module, "KryotoO_LoadPlugins");
+        m_InstallHooks = (Fn_InstallHooks)GetProcAddress(m_Module, "KryotoO_InstallHooks");
+        m_InitPlugins = (Fn_InitPlugins)GetProcAddress(m_Module, "KryotoO_InitPlugins");
+        m_ShutdownFn = (Fn_Shutdown)GetProcAddress(m_Module, "KryotoO_Shutdown");
+
+        if (!m_Startup || !m_LoadPlugins || !m_InstallHooks || !m_InitPlugins || !m_ShutdownFn)
+        {
+            log("[KryotoOnline] %s is missing exports - ignoring it.", KRYOTOO_CORE_DLL);
             m_Module = nullptr;
             return false;
         }
@@ -100,10 +110,18 @@ public:
         return m_Ready ? m_LoadPlugins() : 0u;
     }
 
-    void InstallSpoofHooks(void* utils, void* apps)
+    /// Hook the live client. `resolve` hands back an interface by
+    /// version string against whichever pipe is being hooked.
+    void InstallHooks(KryotoO_GetInterfaceFn resolve, bool gameServer)
     {
-        if (m_Ready)
-            m_InstallSpoofHooks(utils, apps);
+        if (!m_Ready || !resolve)
+            return;
+
+        KryotoO_Interfaces ifaces = {};
+        ifaces.StructSize = sizeof(ifaces);
+        ifaces.GetInterface = resolve;
+        ifaces.IsGameServer = gameServer ? 1 : 0;
+        m_InstallHooks(&ifaces);
     }
 
     unsigned int InitPlugins(const void* ctx)
@@ -164,7 +182,7 @@ private:
     typedef uint32_t(__cdecl* Fn_AbiVersion)(void);
     typedef int32_t(__cdecl* Fn_Startup)(const KryotoO_Host*, KryotoO_Config*);
     typedef uint32_t(__cdecl* Fn_LoadPlugins)(void);
-    typedef void(__cdecl* Fn_InstallSpoofHooks)(void*, void*);
+    typedef void(__cdecl* Fn_InstallHooks)(const KryotoO_Interfaces*);
     typedef uint32_t(__cdecl* Fn_InitPlugins)(const void*);
     typedef void(__cdecl* Fn_Shutdown)(void);
 
@@ -174,7 +192,7 @@ private:
     Fn_AbiVersion        m_AbiVersion = nullptr;
     Fn_Startup           m_Startup = nullptr;
     Fn_LoadPlugins       m_LoadPlugins = nullptr;
-    Fn_InstallSpoofHooks m_InstallSpoofHooks = nullptr;
+    Fn_InstallHooks      m_InstallHooks = nullptr;
     Fn_InitPlugins       m_InitPlugins = nullptr;
     Fn_Shutdown          m_ShutdownFn = nullptr;
 
@@ -190,5 +208,8 @@ private:
         0,                       // DlcCount
         nullptr,                 // Dlc
         0,                       // HaveIni
+        0,                       // LobbyIsolation: off without a core to filter searches
+        "kryoto_app",            // LobbyTagKey
+        "",                      // LobbyTagValue
     };
 };
