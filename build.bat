@@ -63,6 +63,11 @@ call :build "kryotoO.vcxproj"       Win32 "kryotoO32.dll"     || exit /b 1
 call :build "kryoto_online.vcxproj" x64   "steam_api64.dll"   || exit /b 1
 call :build "kryoto_online.vcxproj" Win32 "steam_api.dll"     || exit /b 1
 
+rem Every plugin under plugins/, so a new plugin is picked up without
+rem touching this file. Release|x64 only: the plugins link the release
+rem libMinHook.x64.lib, which has no debug variant.
+for /r "plugins" %%p in (*.vcxproj) do call :build "%%~dpnp" x64 "%%~np" || exit /b 1
+
 echo ========================================
 echo  All builds completed successfully
 echo ========================================
@@ -71,6 +76,9 @@ echo  x86: %OUTDIR%\x86\steam_api.dll   + kryotoO32.dll
 echo.
 echo  Ship BOTH files from a folder together - the proxy loads
 echo  the core from beside itself.
+echo  The steam_overlay proxy builds as overlay_proxy.dll and is
+echo  copied to version.dll (Unity) and winmm.dll (Unreal) at
+echo  build time, so all three are ready to deploy.
 echo ========================================
 pause
 exit /b 0

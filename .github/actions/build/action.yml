@@ -64,6 +64,8 @@ runs:
           if ($LASTEXITCODE -ne 0) { throw "Plugin build failed: $($p.Name)" }
         }
 
+    # The steam_overlay proxy is x64-only and its vcxproj already emits
+    # overlay_proxy.dll, version.dll, and winmm.dll via a post-link target.
     - name: Verify build outputs
       shell: pwsh
       run: |
@@ -117,6 +119,17 @@ runs:
             Copy-Item 'patch.bat' "$Root/patch.bat" -Force
             $photon = "plugins/photon_universal/relbuild/x64/photon_universal.dll"
             if (Test-Path $photon) { Copy-Item $photon "$Root/photon_universal.dll" -Force }
+          }
+
+          # The steam_overlay proxy is a renameable system-DLL that a
+          # game loads at process start (deployed as version.dll for
+          # Unity or winmm.dll for Unreal). Ship all three names at the
+          # root so the patcher can pick whichever the target engine
+          # needs.
+          $overlayDir = "plugins/steam_overlay/relbuild/x64"
+          foreach ($name in @('overlay_proxy.dll','version.dll','winmm.dll')) {
+            $src = "$overlayDir/$name"
+            if (Test-Path $src) { Copy-Item $src "$Root/$name" -Force }
           }
         }
 
